@@ -1,0 +1,223 @@
+name: Build and Release Whisper Plugin
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-natives:
+    name: Build Native Runtime (${{ matrix.platform }} - ${{ matrix.backend || matrix.abi }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - platform: win-x64
+            backend: cpu
+            os: windows-latest
+          - platform: win-x64
+            backend: vulkan
+            os: windows-latest
+          # macOS
+          - platform: macos-arm64
+            backend: metal
+            os: macos-latest
+          # Android
+          - platform: android
+            abi: arm64-v8a
+            os: ubuntu-latest
+          - platform: android
+            abi: armeabi-v7a
+            os: ubuntu-latest
+          - platform: android
+            abi: x86_64
+            os: ubuntu-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Initialize Submodule
+        run: git submodule update --init --recursive
+
+      # Vulkan Setup (Windows Only)
+      - name: Setup Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        uses: humbletim/install-vulkan-sdk@v1.1.1
+        with:
+          version: latest
+          cache: true
+
+      # Windows - CPU Configuration
+      - name: CMake Configuration (Windows CPU)
+        if: matrix.platform == 'win-x64' && matrix.backend == 'cpu'
+        run: cmake -B build -S whisper -DBUILD_SHARED_LIBS=ON -DGGML_VULKAN=OFF -DCMAKE_BUILD_TYPE=Release
+
+      # Windows - Vulkan Configuration
+      - name: CMake Configuration (Windows Vulkan)
+        if: matrix.platform == 'win-x64' && matrix.backend == 'vulkan'
+        run: cmake -B build -S whisper -DBUILD_SHARED_LIBS=ON -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
+
+      # macOS Configuration
+      - name: CMake Configuration (macOS Metal)
+        if: matrix.platform == 'macos-arm64'
+        run: cmake -B build -S whisper -DBUILD_SHARED_LIBS=ON -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+
+      # Android Configuration
+      - name: CMake Configuration (Android)
+        if: matrix.platform == 'android'
+        run: |
+          cmake -B build -S whisper \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DANDROID_PLATFORM=android-21 \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_BUILD_TYPE=Release
+
+      # Compilation Step
+      - name: Compile Library
+        run: cmake --build build --config Release -j
+
+      # Packaging Phase
+      - name: Package Artifacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "${{ matrix.platform }}" = "win-x64" ]; then
+            cp build/bin/Release/*.dll dist/
+          elif [ "${{ matrix.platform }}" = "macos-arm64" ]; then
+            cp build/bin/Release/*.dylib dist/ 2>/dev/null || cp build/bin/*.dylib dist/
+            cp build/bin/Release/*.metal dist/ 2>/dev/null || cp build/bin/*.metal dist/ || true
+          elif [ "${{ matrix.platform }}" = "android" ]; then
+            mkdir -p dist/${{ matrix.abi }}
+            find build -name "*.so" -exec cp {} dist/${{ matrix.abi }}/ \;
+          fi
+
+      # Upload raw directories (actions/upload-artifact@v4 zips them automatically)
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-native-${{ matrix.platform }}-${{ matrix.backend || matrix.abi }}
+          path: dist/
+
+  build-managed:
+    name: Build Managed Whisper.net
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0'
+
+      - name: Build Managed Assembly
+        run: |
+          dotnet restore
+          dotnet publish Whisper.net/Whisper.net.csproj -c Release -f netstandard2.1 -o publish_out
+
+      - name: Package Managed Assembly
+        run: |
+          mkdir -p dist
+          cp publish_out/*.dll dist/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-managed
+          path: dist/
+
+  publish-combined-release:
+    name: Create GitHub Release
+    needs: [build-natives, build-managed]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows CPU Native
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-native-win-x64-cpu
+          path: temp_win_cpu
+
+      - name: Download Windows Vulkan Native
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-native-win-x64-vulkan
+          path: temp_win_vulkan
+
+      - name: Download macOS Native
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-native-macos-arm64-metal
+          path: temp_mac
+
+      - name: Download Android arm64-v8a Native
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-native-android-arm64-v8a
+          path: temp_android_arm64
+
+      - name: Download Android armeabi-v7a Native
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-native-android-armeabi-v7a
+          path: temp_android_arm32
+
+      - name: Download Android x86_64 Native
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-native-android-x86_64
+          path: temp_android_x64
+
+      - name: Download Managed assembly
+        uses: actions/download-artifact@v4
+        with:
+          name: whisper-managed
+          path: temp_managed
+
+      - name: Consolidate Zip Structure
+        run: |
+          mkdir -p release/Managed/runtimes/win-x64
+          mkdir -p release/Managed/runtimes/vulkan/win-x64
+          mkdir -p release/Managed/runtimes/macos-arm64
+          mkdir -p release/Managed/runtimes/android/arm64-v8a
+          mkdir -p release/Managed/runtimes/android/armeabi-v7a
+          mkdir -p release/Managed/runtimes/android/x86_64
+
+          # Copy Managed Assembly DLLs
+          cp temp_managed/*.dll release/Managed/
+
+          # Copy Windows CPU DLLs
+          cp temp_win_cpu/*.dll release/Managed/runtimes/win-x64/
+
+          # Copy Windows Vulkan DLLs
+          cp temp_win_vulkan/*.dll release/Managed/runtimes/vulkan/win-x64/
+
+          # Copy macOS Dynamic Libraries
+          cp temp_mac/*.dylib release/Managed/runtimes/macos-arm64/
+          cp temp_mac/*.metal release/Managed/runtimes/macos-arm64/ 2>/dev/null || true
+
+          # Copy Android Shared Objects (.so)
+          cp -r temp_android_arm64/arm64-v8a/*.so release/Managed/runtimes/android/arm64-v8a/
+          cp -r temp_android_arm32/armeabi-v7a/*.so release/Managed/runtimes/android/armeabi-v7a/
+          cp -r temp_android_x64/x86_64/*.so release/Managed/runtimes/android/x86_64/
+
+          # Compress Unity Package
+          cd release
+          zip -r ../whisper-unity-assets.zip *
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: whisper-unity-assets.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
